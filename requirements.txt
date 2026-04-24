@@ -1,0 +1,5 @@
+fastmcp
+boto3
+httpx
+google-adk
+python-dotenv
