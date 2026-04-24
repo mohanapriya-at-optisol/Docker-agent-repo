@@ -1,0 +1,48 @@
+# Service Topology: i-0c3f590b4a9bbddbd
+
+**Compose files:** /home/ubuntu/mern-app-testing/docker-compose.yml
+**Generated:** 2026-04-24 11:48:03 UTC
+
+```mermaid
+graph LR
+  frontend["frontend"] ==>|service_started| backend["backend"]
+  backend["backend"] ==>|service_started| mongo["mongo"]
+```
+
+## Services
+
+### 🟢 frontend
+- Image: <build:./frontend>
+- State: running (Up 35 minutes)
+- Container: mern-app-testing-frontend-1
+- Ports: 80:80
+- depends_on: backend
+- Restart: always
+- Healthcheck defined: False
+
+### 🟢 backend
+- Image: <build:./backend>
+- State: running (Up 35 minutes)
+- Container: mern-app-testing-backend-1
+- Ports: 5000:5000
+- depends_on: mongo
+- Restart: always
+- Healthcheck defined: False
+
+### 🟢 mongo
+- Image: mongo:6.0
+- State: running (Up 35 minutes)
+- Container: mern-app-testing-mongo-1
+- Ports: 27017:27017
+- depends_on: none
+- Restart: always
+- Healthcheck defined: False
+
+## Broken Services
+
+
+## Cascade Risk
+
+
+## Investigation Order
+
