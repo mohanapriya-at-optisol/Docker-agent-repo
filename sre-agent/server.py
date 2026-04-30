@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import shlex
 import time
 from typing import Annotated
 
@@ -12,18 +14,20 @@ from pydantic import Field
 mcp = FastMCP("docker-ssm-agent")
 ssm = boto3.client("ssm")
 PROM_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
-ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "http://localhost:9093")
+TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
 
 
 def _ssm(instance_id: str, command: str) -> str:
+    if not re.fullmatch(r"i-[0-9a-f]{8,17}", instance_id):
+        return json.dumps({"error": f"Invalid instance_id format: {instance_id}"})
     resp = ssm.send_command(
         InstanceIds=[instance_id],
         DocumentName="AWS-RunShellScript",
         Parameters={"commands": [command]},
     )
     cmd_id = resp["Command"]["CommandId"]
-    for _ in range(15):
-        time.sleep(2)
+    for _ in range(30):
+        time.sleep(3)
         result = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
         if result["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
             stdout = result.get("StandardOutputContent", "")
@@ -267,8 +271,18 @@ def get_container_disk_usage(
     - filesystem: df -h output from inside the container showing mounted filesystem usage
     Use this to diagnose containers running out of disk space.
     """
-    fs_raw = _ssm(instance_id, f"docker exec {container_name} df -h 2>&1")
-    size_raw = _ssm(instance_id, f"docker inspect --size {container_name} --format '{{{{.SizeRootFs}}}} {{{{.SizeRw}}}}'")
+    # Get filesystem usage from host via overlay path — no docker exec needed
+    merged_path = _ssm(
+        instance_id,
+        f"docker inspect --format '{{{{.GraphDriver.Data.MergedDir}}}}' {shlex.quote(container_name)} 2>/dev/null"
+    ).strip()
+
+    if merged_path and not merged_path.startswith('{"error"'):
+        fs_raw = _ssm(instance_id, f"df -h {shlex.quote(merged_path)} 2>/dev/null")
+    else:
+        fs_raw = "Could not resolve container overlay path"
+
+    size_raw = _ssm(instance_id, f"docker inspect --size {shlex.quote(container_name)} --format '{{{{.SizeRootFs}}}} {{{{.SizeRw}}}}'")
 
     result = {
         "container": container_name,
@@ -388,7 +402,9 @@ def search_container_logs(
     Use this to find specific error messages, stack traces, or keywords
     without retrieving the full log. Returns matching lines with line numbers.
     """
-    cmd = f"docker logs --tail {tail_lines} {container_name} 2>&1 | grep -E -n -i \"{pattern}\" | tail -50"
+    safe_name = shlex.quote(container_name)
+    safe_pattern = shlex.quote(pattern)
+    cmd = f"docker logs --tail {tail_lines} {safe_name} 2>&1 | grep -E -n -i {safe_pattern} | tail -50"
     output = _ssm(instance_id, cmd)
     if output.startswith('{"error"'):
         return output
@@ -449,6 +465,411 @@ def get_host_oom_logs(
         "oom_events_found": len(lines),
         "oom_logs": lines if lines else ["No OOM events found in dmesg"],
     }, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_container_processes(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    container_name: Annotated[str, Field(description="Name of the container to inspect processes in.")],
+) -> str:
+    """Show running processes inside a Docker container via SSM.
+
+    Returns output of docker top — process list with CPU time, PID, and command.
+    Use this when a container has high CPU but no error in logs, to identify
+    which process or operation is consuming the CPU.
+    """
+    output = _ssm(instance_id, f"docker top {container_name} -eo pid,pcpu,pmem,etime,comm,args")
+    if output.startswith('{"error"'):
+        return output
+    return json.dumps({"container": container_name, "processes": output}, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_nginx_access_logs(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    container_name: Annotated[str, Field(description="Name of the nginx/frontend container.")],
+    tail_lines: Annotated[int, Field(description="Number of recent access log lines to return.", ge=10, le=200)] = 50,
+) -> str:
+    """Get nginx access logs showing recent HTTP requests, status codes, and response times.
+
+    Use this when the app is slow or returning errors but container logs are clean.
+    Shows which endpoints are being hit, their HTTP status codes, and response sizes.
+    Helps identify which specific endpoint is causing high CPU or timeouts.
+    """
+    output = _ssm(instance_id, f"docker logs --tail {tail_lines} {container_name} 2>&1 | grep -v '^/' | grep -E '[0-9]{{3}} [0-9]+'")
+    if output.startswith('{"error"'):
+        return output
+    lines = [l for l in output.strip().split("\n") if l]
+    return json.dumps({"container": container_name, "access_logs": lines, "total": len(lines)}, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_db_diagnostics(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    db_container: Annotated[str, Field(description="Name of the database container to diagnose.")],
+) -> str:
+    """Run database diagnostics on any database container via SSM.
+
+    Works with any database (MongoDB, PostgreSQL, MySQL, Redis, etc.).
+    Returns:
+    - container_logs: last 100 lines of database logs filtered for slow queries,
+      errors, warnings, and performance issues
+    - resource_usage: CPU and memory usage of the database container
+
+    Use this when:
+    - Requests are timing out but the app container is still running
+    - Logs show buffering timeouts or slow response times
+    - You suspect a database performance issue (missing index, large scan, auth failure)
+    """
+    log_raw = _ssm(
+        instance_id,
+        f"docker logs --tail 100 {db_container} 2>&1 | grep -iE 'error|warn|slow|timeout|COLLSCAN|auth|denied|refused|ms$|fatal' | tail -30"
+    )
+    stats_raw = _ssm(
+        instance_id,
+        f"docker stats --no-stream --format '{{{{.Name}}}} CPU:{{{{.CPUPerc}}}} MEM:{{{{.MemUsage}}}} MEM%:{{{{.MemPerc}}}}' {db_container} 2>/dev/null"
+    )
+
+    return json.dumps({
+        "instance_id": instance_id,
+        "db_container": db_container,
+        "filtered_logs": log_raw if not log_raw.startswith('{"error"') else log_raw,
+        "resource_usage": stats_raw if not stats_raw.startswith('{"error"') else stats_raw,
+    }, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_ec2_instance_health(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+) -> str:
+    """Check EC2 instance health status via AWS API.
+
+    Returns system status check and instance status check results.
+    - System status: AWS infrastructure health (hypervisor, network, power)
+    - Instance status: OS-level health (kernel, network config)
+
+    Use this when SSM commands are failing or the instance is unreachable,
+    to determine if the problem is at the AWS infrastructure level vs the OS level.
+    If either check is 'impaired', it's an AWS-level problem — no amount of
+    Docker debugging will fix it.
+    """
+    try:
+        ec2 = boto3.client("ec2")
+        resp = ec2.describe_instance_status(
+            InstanceIds=[instance_id],
+            IncludeAllInstances=True,
+        )
+        statuses = resp.get("InstanceStatuses", [])
+        if not statuses:
+            return json.dumps({"error": f"No status found for instance {instance_id}"})
+
+        s = statuses[0]
+        return json.dumps({
+            "instance_id": instance_id,
+            "instance_state": s.get("InstanceState", {}).get("Name", "unknown"),
+            "system_status": {
+                "status": s.get("SystemStatus", {}).get("Status", "unknown"),
+                "details": s.get("SystemStatus", {}).get("Details", []),
+            },
+            "instance_status": {
+                "status": s.get("InstanceStatus", {}).get("Status", "unknown"),
+                "details": s.get("InstanceStatus", {}).get("Details", []),
+            },
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_security_group_rules(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+) -> str:
+    """Get security group inbound rules for an EC2 instance via AWS API.
+
+    Returns all inbound rules across all security groups attached to the instance,
+    showing which ports are open and from which sources.
+
+    Use this when the app is unreachable from outside but containers are running fine.
+    A missing inbound rule for port 80/443 is invisible from inside the instance —
+    this is the only way to detect it without SSH access.
+    """
+    try:
+        ec2 = boto3.client("ec2")
+
+        # Get security group IDs attached to the instance
+        inst_resp = ec2.describe_instances(InstanceIds=[instance_id])
+        reservations = inst_resp.get("Reservations", [])
+        if not reservations:
+            return json.dumps({"error": f"Instance {instance_id} not found"})
+
+        instance = reservations[0]["Instances"][0]
+        sg_ids = [sg["GroupId"] for sg in instance.get("SecurityGroups", [])]
+        public_ip = instance.get("PublicIpAddress", "N/A")
+        private_ip = instance.get("PrivateIpAddress", "N/A")
+
+        if not sg_ids:
+            return json.dumps({"error": "No security groups attached to instance"})
+
+        # Get inbound rules for all security groups
+        sg_resp = ec2.describe_security_groups(GroupIds=sg_ids)
+        rules_by_sg = []
+        for sg in sg_resp.get("SecurityGroups", []):
+            inbound = []
+            for rule in sg.get("IpPermissions", []):
+                from_port = rule.get("FromPort", -1)
+                to_port = rule.get("ToPort", -1)
+                protocol = rule.get("IpProtocol", "-1")
+                sources = (
+                    [r["CidrIp"] for r in rule.get("IpRanges", [])] +
+                    [r["CidrIpv6"] for r in rule.get("Ipv6Ranges", [])] +
+                    [r["GroupId"] for r in rule.get("UserIdGroupPairs", [])]
+                )
+                inbound.append({
+                    "protocol": "all" if protocol == "-1" else protocol,
+                    "from_port": from_port,
+                    "to_port": to_port,
+                    "sources": sources,
+                })
+            rules_by_sg.append({
+                "sg_id": sg["GroupId"],
+                "sg_name": sg["GroupName"],
+                "inbound_rules": inbound,
+            })
+
+        return json.dumps({
+            "instance_id": instance_id,
+            "public_ip": public_ip,
+            "private_ip": private_ip,
+            "security_groups": rules_by_sg,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_healthcheck_status(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    container_name: Annotated[str, Field(description="Name of the container to check healthcheck status for.")],
+) -> str:
+    """Get full healthcheck status and history for a Docker container via SSM.
+
+    Returns healthcheck configuration, current status (healthy/unhealthy/starting),
+    failing streak count, and output of the last 10 healthcheck runs.
+
+    Use this when:
+    - A container shows as 'running' but dependants are getting 503 errors
+    - depends_on uses condition: service_healthy and the dependent won't start
+    - You suspect a service is up but not actually ready to serve traffic
+    """
+    safe_name = shlex.quote(container_name)
+    raw = _ssm(instance_id, f"docker inspect {safe_name} 2>/dev/null")
+    if raw.startswith('{"error"'):
+        return raw
+
+    try:
+        info = json.loads(raw)[0]
+        state = info.get("State", {})
+        health = state.get("Health", {})
+        config = info.get("Config", {}).get("Healthcheck", {})
+
+        log_entries = []
+        for entry in (health.get("Log") or [])[-10:]:
+            log_entries.append({
+                "start": entry.get("Start", ""),
+                "end": entry.get("End", ""),
+                "exit_code": entry.get("ExitCode", -1),
+                "output": entry.get("Output", "").strip()[:300],
+            })
+
+        return json.dumps({
+            "container": container_name,
+            "health_status": health.get("Status", "none"),
+            "failing_streak": health.get("FailingStreak", 0),
+            "healthcheck_config": {
+                "test": config.get("Test", []),
+                "interval": config.get("Interval", 0),
+                "timeout": config.get("Timeout", 0),
+                "retries": config.get("Retries", 0),
+                "start_period": config.get("StartPeriod", 0),
+            },
+            "last_10_checks": log_entries,
+        }, indent=2)
+    except (json.JSONDecodeError, IndexError) as e:
+        return json.dumps({"error": f"Failed to parse inspect output: {e}"})
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_image_info(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    container_name: Annotated[str, Field(description="Name of the container to inspect the image of.")],
+) -> str:
+    """Inspect the Docker image used by a container — entrypoint, CMD, base image, and layer history.
+
+    Use this when a container exits immediately with no logs, to understand
+    what the image tries to run. Catches entrypoint/CMD mismatches, missing
+    binaries, and wrong base image issues.
+    """
+    safe_name = shlex.quote(container_name)
+    image_raw = _ssm(instance_id, f"docker inspect {safe_name} --format '{{{{.Config.Image}}}}'")
+    if image_raw.startswith('{"error"'):
+        return image_raw
+    image_name = image_raw.strip()
+
+    history_raw = _ssm(instance_id, f"docker history --no-trunc {shlex.quote(image_name)} 2>/dev/null | head -20")
+    inspect_raw = _ssm(instance_id, f"docker inspect {shlex.quote(image_name)} 2>/dev/null")
+
+    entrypoint = cmd = base = ""
+    try:
+        info = json.loads(inspect_raw)
+        if isinstance(info, list):
+            info = info[0]
+        cfg = info.get("Config", {})
+        entrypoint = cfg.get("Entrypoint") or []
+        cmd = cfg.get("Cmd") or []
+        base = info.get("Os", "") + "/" + info.get("Architecture", "")
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass
+
+    return json.dumps({
+        "container": container_name,
+        "image": image_name,
+        "entrypoint": entrypoint,
+        "cmd": cmd,
+        "os_arch": base,
+        "layer_history": history_raw if not history_raw.startswith('{"error"') else history_raw,
+    }, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_network_diagnostics(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    container_name: Annotated[str, Field(description="Name of the container to check network for.")],
+) -> str:
+    """Get full network diagnostics for a container on a remote EC2 instance via SSM.
+
+    Returns:
+    - container networks and IP addresses
+    - DNS resolution test for each service on the same network
+    - host listening ports (ss -tlnp)
+
+    Use this when inter-container communication fails — ENOTFOUND means DNS failure,
+    ECONNREFUSED means the service is not listening. These look identical from app logs
+    without this tool.
+    """
+    safe_name = shlex.quote(container_name)
+
+    # Get container's networks and IPs
+    net_raw = _ssm(instance_id, f"docker inspect {safe_name} --format '{{{{json .NetworkSettings.Networks}}}}'")
+
+    # Get all containers on same networks for DNS check
+    peers_raw = _ssm(instance_id, "docker ps --format '{{.Names}}'")
+
+    # Host listening ports
+    ports_raw = _ssm(instance_id, "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null")
+
+    networks = {}
+    try:
+        networks = json.loads(net_raw) if not net_raw.startswith('{"error"') else {}
+    except json.JSONDecodeError:
+        pass
+
+    return json.dumps({
+        "container": container_name,
+        "networks": networks,
+        "peer_containers": [l for l in peers_raw.strip().split("\n") if l] if not peers_raw.startswith('{"error"') else [],
+        "host_listening_ports": ports_raw if not ports_raw.startswith('{"error"') else ports_raw,
+    }, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_volume_diagnostics(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    container_name: Annotated[str, Field(description="Name of the container to check mounts for.")],
+) -> str:
+    """Check all volume mounts for a container — verifies source paths exist and shows permissions.
+
+    Use this when a container crashes with no logs. A missing mount path is a
+    common silent failure — the container starts, tries to read a config file
+    or data directory from a volume that doesn't exist on the host, and crashes
+    before logging anything.
+    """
+    safe_name = shlex.quote(container_name)
+    mounts_raw = _ssm(instance_id, f"docker inspect {safe_name} --format '{{{{json .Mounts}}}}'")
+    if mounts_raw.startswith('{"error"'):
+        return mounts_raw
+
+    try:
+        mounts = json.loads(mounts_raw) or []
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Failed to parse mounts", "raw": mounts_raw[:200]})
+
+    results = []
+    for m in mounts:
+        src = m.get("Source", "")
+        if src:
+            stat = _ssm(instance_id, f"stat {shlex.quote(src)} 2>&1 || echo NOT_FOUND")
+            perms = _ssm(instance_id, f"ls -la {shlex.quote(src)} 2>&1 | head -5") if "NOT_FOUND" not in stat else "N/A"
+        else:
+            stat = "no source path (named volume)"
+            perms = "N/A"
+
+        results.append({
+            "type": m.get("Type"),
+            "source": src,
+            "destination": m.get("Destination"),
+            "mode": m.get("Mode"),
+            "exists": "NOT_FOUND" not in stat,
+            "permissions": perms if not perms.startswith('{"error"') else "error checking",
+        })
+
+    return json.dumps({"container": container_name, "mounts": results}, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False))
+def notify_teams(
+    alert_name: Annotated[str, Field(description="Name of the alert or incident.")],
+    instance_id: Annotated[str, Field(description="EC2 instance ID.")],
+    container_name: Annotated[str, Field(description="Name of the affected container.")],
+    root_cause: Annotated[str, Field(description="One sentence root cause with exact log quote.")],
+    immediate_fix: Annotated[str, Field(description="Exact shell command to fix the issue.")],
+    long_term_fix: Annotated[str, Field(description="Config or architecture change to prevent recurrence.")],
+    impact: Annotated[str, Field(description="What was affected — services, endpoints, users.")],
+    timeline: Annotated[str, Field(description="Brief timeline of when it started and how it progressed.")],
+    severity: Annotated[str, Field(description="Severity: critical, warning, or info.")],
+    rca_file: Annotated[str, Field(description="Path to the saved RCA markdown file.")] = "",
+) -> str:
+    """Post RCA summary to Microsoft Teams via workflow webhook as an Adaptive Card.
+
+    Sends a rich card with full incident details including timeline, root cause,
+    impact, immediate fix, and long-term fix.
+    Call this AFTER save_rca_report to notify the team automatically.
+    """
+    if not TEAMS_WEBHOOK_URL:
+        return json.dumps({"status": "skipped", "reason": "TEAMS_WEBHOOK_URL not configured"})
+
+    severity_emoji = "🔴" if severity == "critical" else "🟡" if severity == "warning" else "🟢"
+
+    payload = {
+        "alert_name": f"{severity_emoji} {alert_name}",
+        "container_name": container_name,
+        "instance_id": instance_id,
+        "severity": severity.upper(),
+        "rca_details": (
+            f"**Timeline:** {timeline}\n\n"
+            f"**Root Cause:** {root_cause}\n\n"
+            f"**Impact:** {impact}\n\n"
+            f"**Long-term Fix:** {long_term_fix}"
+            + (f"\n\n📄 Report: `{rca_file}`" if rca_file else "")
+        ),
+        "remediation_command": immediate_fix,
+    }
+
+    try:
+        resp = httpx.post(TEAMS_WEBHOOK_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        return json.dumps({"status": "sent", "alert": alert_name, "instance": instance_id})
+    except httpx.HTTPError as e:
+        return json.dumps({"status": "failed", "error": str(e)})
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False))
