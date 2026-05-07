@@ -69,7 +69,18 @@ def list_repo_files(
 
     Use this to explore the repo structure before reading specific files.
     Returns file names, types (file/dir), and sizes.
+    
+    SECURITY: Filters out sensitive files from listings to prevent accidental access.
     """
+    # Security: Hide sensitive files from directory listings
+    HIDDEN_FILES = {
+        '.env', '.env.local', '.env.production', '.env.development', '.env.test',
+        'credentials.json', 'credentials.yml', 'credentials.yaml',
+        'secrets.json', 'secrets.yml', 'secrets.yaml',
+        'private.key', 'private.pem', 'auth.json',
+        '.npmrc', '.pypirc',
+    }
+    
     params = {}
     if ref:
         params["ref"] = ref
@@ -77,12 +88,20 @@ def list_repo_files(
     if "error" in data:
         return json.dumps(data)
     if isinstance(data, list):
-        return json.dumps([{
-            "name": f["name"],
-            "type": f["type"],
-            "path": f["path"],
-            "size": f.get("size", 0),
-        } for f in data], indent=2)
+        # Filter out sensitive files
+        filtered = []
+        for f in data:
+            file_name = f["name"].lower()
+            # Skip if exact match or ends with sensitive extension
+            if file_name in HIDDEN_FILES or file_name.endswith(('.key', '.pem')):
+                continue
+            filtered.append({
+                "name": f["name"],
+                "type": f["type"],
+                "path": f["path"],
+                "size": f.get("size", 0),
+            })
+        return json.dumps(filtered, indent=2)
     return json.dumps(data, indent=2)
 
 
@@ -97,7 +116,39 @@ def read_file(
     Use this to read source code, Dockerfiles, docker-compose files, config files.
     For RCA: read the file at the commit that was deployed when the incident started.
     Returns decoded file content as plain text.
+    
+    SECURITY: Blocks reading of sensitive files containing secrets (.env, credentials, keys, etc.)
     """
+    # Security: Block reading sensitive files that may contain secrets
+    BLOCKED_FILES = {
+        '.env', '.env.local', '.env.production', '.env.development', '.env.test',
+        'credentials.json', 'credentials.yml', 'credentials.yaml',
+        'secrets.json', 'secrets.yml', 'secrets.yaml',
+        '.aws/credentials', '.ssh/id_rsa', '.ssh/id_ed25519',
+        'private.key', 'private.pem', '*.key', '*.pem',
+        '.npmrc', '.pypirc', 'auth.json',
+    }
+    
+    # Check if the file path matches any blocked pattern
+    file_name = path.split('/')[-1].lower()
+    path_lower = path.lower()
+    
+    for blocked in BLOCKED_FILES:
+        if blocked.startswith('*'):
+            # Pattern match for extensions like *.key
+            if file_name.endswith(blocked[1:]):
+                return json.dumps({
+                    "error": f"Access denied: Cannot read sensitive file '{path}'. This file may contain secrets or credentials.",
+                    "blocked_pattern": blocked,
+                    "security_note": "If you need configuration values, ask the user or check environment variables in the running container using inspect_container."
+                })
+        elif file_name == blocked or path_lower.endswith(blocked):
+            return json.dumps({
+                "error": f"Access denied: Cannot read sensitive file '{path}'. This file may contain secrets or credentials.",
+                "blocked_file": blocked,
+                "security_note": "If you need configuration values, ask the user or check environment variables in the running container using inspect_container."
+            })
+    
     params = {}
     if ref:
         params["ref"] = ref
