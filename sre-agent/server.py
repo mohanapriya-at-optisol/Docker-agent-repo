@@ -356,16 +356,6 @@ def get_docker_events(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
-def debug_env() -> str:
-    """Debug tool to check environment variables loaded in the MCP server."""
-    return json.dumps({
-        "PROMETHEUS_URL": os.environ.get("PROMETHEUS_URL", "NOT SET"),
-        "ALERTMANAGER_URL": os.environ.get("ALERTMANAGER_URL", "NOT SET"),
-        "AWS_DEFAULT_REGION": os.environ.get("AWS_DEFAULT_REGION", "NOT SET"),
-    }, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 def get_host_diagnostics(
     instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
 ) -> str:
@@ -536,6 +526,75 @@ def get_db_diagnostics(
         "filtered_logs": log_raw if not log_raw.startswith('{"error"') else log_raw,
         "resource_usage": stats_raw if not stats_raw.startswith('{"error"') else stats_raw,
     }, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_recent_deployments(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+    since: Annotated[str, Field(description="How far back to look (e.g. '2h', '24h', '7d').")] = "24h",
+) -> str:
+    """Detect recent deployments on an EC2 instance by checking Docker events for image pulls and container restarts.
+
+    Returns a timeline of image pulls, container stops, starts, and recreations.
+    Use this when an incident started recently and you suspect a deployment caused it.
+    Cross-reference the deployment timestamp with the incident start time.
+    """
+    cmd = f"docker events --since {since} --until 0s --filter type=image --filter type=container --format '{{{{json .}}}}'"
+    output = _ssm(instance_id, cmd)
+    if output.startswith('{"error"'):
+        return output
+
+    deployments = []
+    for line in output.strip().split("\n"):
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+            action = event.get("Action", "")
+            if action in ("pull", "stop", "start", "create", "destroy", "kill"):
+                deployments.append({
+                    "time": event.get("time", ""),
+                    "type": event.get("Type", ""),
+                    "action": action,
+                    "name": event.get("Actor", {}).get("Attributes", {}).get("name", "")
+                          or event.get("Actor", {}).get("Attributes", {}).get("image", ""),
+                    "image": event.get("Actor", {}).get("Attributes", {}).get("image", ""),
+                })
+        except json.JSONDecodeError:
+            continue
+
+    return json.dumps({
+        "instance_id": instance_id,
+        "since": since,
+        "total_events": len(deployments),
+        "deployment_events": deployments,
+        "summary": f"Found {len([d for d in deployments if d['action'] == 'pull'])} image pulls and "
+                   f"{len([d for d in deployments if d['action'] in ('stop', 'start', 'create')])} container lifecycle events",
+    }, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def get_ssh_activity(
+    instance_id: Annotated[str, Field(description="EC2 instance ID (e.g. 'i-0abc123def456').")],
+) -> str:
+    """Check SSH login activity on a remote EC2 instance via SSM.
+
+    Returns recent successful logins, failed attempts, and currently logged-in users.
+    Use this to detect if someone manually SSH'd into the server around the incident time
+    and may have run docker commands that caused the outage.
+    """
+    commands = {
+        "recent_logins": "last -n 20 2>/dev/null | head -20",
+        "current_users": "who 2>/dev/null",
+        "auth_log_ssh": "grep 'sshd' /var/log/auth.log 2>/dev/null | tail -20 || grep 'sshd' /var/log/secure 2>/dev/null | tail -20 || echo 'auth log not accessible'",
+        "failed_logins": "grep 'Failed password' /var/log/auth.log 2>/dev/null | tail -10 || grep 'Failed password' /var/log/secure 2>/dev/null | tail -10 || echo 'no failed login data'",
+    }
+    results = {}
+    for key, cmd in commands.items():
+        out = _ssm(instance_id, cmd)
+        results[key] = out if not out.startswith('{"error"') else json.loads(out)
+
+    return json.dumps({"instance_id": instance_id, "ssh_activity": results}, indent=2)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
@@ -855,13 +914,13 @@ def notify_teams(
         "instance_id": instance_id,
         "severity": severity.upper(),
         "rca_details": (
-            f"**Timeline:** {timeline}\n\n"
-            f"**Root Cause:** {root_cause}\n\n"
-            f"**Impact:** {impact}\n\n"
-            f"**Long-term Fix:** {long_term_fix}"
-            + (f"\n\n📄 Report: `{rca_file}`" if rca_file else "")
-        ),
-        "remediation_command": immediate_fix,
+            f"Timeline: {timeline} | "
+            f"Root Cause: {root_cause} | "
+            f"Impact: {impact} | "
+            f"Long-term Fix: {long_term_fix}"
+            + (f" | Report: {rca_file}" if rca_file else "")
+        ).replace('"', "'").replace('\n', ' ').replace('\r', ''),
+        "remediation_command": immediate_fix.replace('"', "'").replace('\n', ' '),
     }
 
     try:
