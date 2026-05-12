@@ -10,10 +10,59 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from dotenv import load_dotenv
+
+# ── Security helpers ──────────────────────────────────────────────────────────
+
+# Env var keys that likely contain secrets — redact their values before
+# passing to the LLM to prevent secrets leaking into RCA reports or context.
+_SENSITIVE_KEY_RE = re.compile(
+    r"(PASSWORD|PASSWD|SECRET|API_KEY|APIKEY|TOKEN|CREDENTIAL|AUTH|PRIVATE|ACCESS_KEY|SIGNING)",
+    re.IGNORECASE,
+)
+
+def _redact_env(env_list: list[str]) -> list[str]:
+    """Redact values of sensitive environment variables."""
+    redacted = []
+    for entry in env_list:
+        if "=" in entry:
+            key, _ = entry.split("=", 1)
+            if _SENSITIVE_KEY_RE.search(key):
+                redacted.append(f"{key}=***REDACTED***")
+                continue
+        redacted.append(entry)
+    return redacted
+
+
+# Phrases that indicate a prompt injection attempt embedded in external data
+# (logs, commit messages, console output). Strip lines containing these before
+# returning tool output to the agent.
+_INJECTION_PATTERNS = re.compile(
+    r"(ignore (previous|all|prior|above) instructions?|"
+    r"you are now|new (role|persona|instructions?)|"
+    r"disregard (your|all|previous)|"
+    r"system prompt|forget (everything|your instructions?)|"
+    r"act as (a |an )?(different|new|unrestricted)|"
+    r"jailbreak|do anything now|dan mode)",
+    re.IGNORECASE,
+)
+
+def _sanitize_external(text: str) -> str:
+    """Remove lines from external data that look like prompt injection attempts."""
+    clean_lines = []
+    for line in text.splitlines():
+        if _INJECTION_PATTERNS.search(line):
+            clean_lines.append("[LINE REDACTED: potential prompt injection detected]")
+        else:
+            clean_lines.append(line)
+    return "\n".join(clean_lines)
+
+load_dotenv()
 
 mcp = FastMCP("docker-ssm-agent")
 ssm = boto3.client("ssm")
 PROM_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
+ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "http://localhost:9093")
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
 
 
@@ -26,8 +75,11 @@ def _ssm(instance_id: str, command: str) -> str:
         Parameters={"commands": [command]},
     )
     cmd_id = resp["Command"]["CommandId"]
-    for _ in range(30):
-        time.sleep(3)
+    # Exponential-ish backoff: poll quickly at first, then slow down.
+    # Total max wait: 1+1+2+2+3+3+4+4+5+5+... capped at 5s = ~120s over 30 attempts
+    for attempt in range(30):
+        wait = min(1 + (attempt // 2), 5)
+        time.sleep(wait)
         result = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
         if result["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
             stdout = result.get("StandardOutputContent", "")
@@ -101,7 +153,7 @@ def inspect_container(
             "restart_count": info.get("RestartCount", 0),
             "started_at": state.get("StartedAt", ""),
             "finished_at": state.get("FinishedAt", ""),
-            "env": config.get("Env", []),
+            "env": _redact_env(config.get("Env", [])),
             "ports": ports,
             "restart_policy": host_config.get("RestartPolicy", {}).get("Name", ""),
         }, indent=2)
@@ -131,7 +183,7 @@ def get_container_logs(
     return json.dumps({
         "container": container_name,
         "lines_returned": len(lines),
-        "logs": output,
+        "logs": _sanitize_external(output),
     }, indent=2)
 
 
@@ -365,19 +417,17 @@ def get_host_diagnostics(
     top memory-consuming processes, and Docker daemon disk usage summary.
     Use this to understand overall host health before diving into containers.
     """
-    commands = {
-        "disk": "df -h --output=source,size,used,avail,pcent,target | head -20",
-        "memory": "free -m",
-        "cpu_load": "uptime",
-        "top_processes": "ps aux --sort=-%mem | head -10 | awk '{print $1,$2,$3,$4,$11}'",
-        "docker_disk": "docker system df",
-    }
-    results = {}
-    for key, cmd in commands.items():
-        out = _ssm(instance_id, cmd)
-        results[key] = out if not out.startswith('{"error"') else json.loads(out)
-
-    return json.dumps({"instance_id": instance_id, "diagnostics": results}, indent=2)
+    cmd = (
+        "echo '---DISK---' && df -h --output=source,size,used,avail,pcent,target | head -20 && "
+        "echo '---MEMORY---' && free -m && "
+        "echo '---CPU_LOAD---' && uptime && "
+        "echo '---TOP_PROCESSES---' && ps aux --sort=-%mem | head -10 | awk '{print $1,$2,$3,$4,$11}' && "
+        "echo '---DOCKER_DISK---' && docker system df"
+    )
+    output = _ssm(instance_id, cmd)
+    if output.startswith('{"error"'):
+        return output
+    return json.dumps({"instance_id": instance_id, "diagnostics": output}, indent=2)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
@@ -399,7 +449,7 @@ def search_container_logs(
     if output.startswith('{"error"'):
         return output
 
-    matches = [line for line in output.strip().split("\n") if line]
+    matches = [_sanitize_external(line) for line in output.strip().split("\n") if line]
     return json.dumps({
         "container": container_name,
         "pattern": pattern,
@@ -945,14 +995,22 @@ def save_rca_report(
     metrics_evidence: Annotated[str, Field(description="Exact metric values or log lines as evidence. Example: 'disk at 94% on /, overlay2 layer 5.2GB, container exit code 1 repeated 11 times'.")] = "",
     topology_mermaid: Annotated[str, Field(description="Mermaid diagram string from get_service_topology showing service dependencies. Include if topology was retrieved.")] = "",
 ) -> str:
-    """Save a structured Root Cause Analysis (RCA) report to a markdown file.
+    """Save a structured Root Cause Analysis (RCA) report to a markdown file and upload to S3.
 
     Call this AFTER completing the full investigation — after you have gathered
     evidence from alerts, container logs, Docker events, and metrics.
-    The report is saved to ./rca_reports/<alert_name>_<instance_id>_<timestamp>.md
+    The report is saved locally to ./rca_reports/ and uploaded to S3 bucket.
+    Timestamps are in IST (Indian Standard Time).
     """
     import datetime
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    from zoneinfo import ZoneInfo
+    
+    # Use IST timezone
+    ist_tz = ZoneInfo("Asia/Kolkata")
+    now_ist = datetime.datetime.now(ist_tz)
+    timestamp = now_ist.strftime("%Y%m%d_%H%M%S")
+    display_time = now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+    
     safe_alert = alert_name.replace(" ", "_").replace("/", "-")
     safe_instance = instance_id.replace(".", "-")
 
@@ -960,13 +1018,15 @@ def save_rca_report(
     server_dir = os.path.dirname(os.path.abspath(__file__))
     reports_dir = os.path.join(server_dir, "rca_reports")
     os.makedirs(reports_dir, exist_ok=True)
-    filename = os.path.join(reports_dir, f"{safe_alert}_{safe_instance}_{timestamp}.md")
+    
+    # Filename format: FaultName-YYYYMMDD-HHMMSS.md (IST)
+    filename = os.path.join(reports_dir, f"{safe_alert}-{timestamp}.md")
 
     report = f"""# RCA Report: {alert_name}
 
 **Instance:** {instance_id}
 **Severity:** {severity}
-**Generated:** {datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
+**Generated:** {display_time}
 
 ---
 
@@ -1007,17 +1067,82 @@ def save_rca_report(
 {long_term_fix}
 
 ---
-*Generated by SRE Agent*
+*Generated by SRE Agent at {display_time}*
 """
     with open(filename, "w") as f:
         f.write(report)
 
-    return json.dumps({
+    # Upload to S3
+    s3_result = {"uploaded": False, "s3_url": None, "error": None}
+    try:
+        s3_bucket = os.environ.get("S3_RCA_BUCKET", "")
+        if s3_bucket:
+            import boto3
+            from botocore.exceptions import ClientError
+            
+            s3_client = boto3.client('s3')
+            
+            # Create bucket if it doesn't exist
+            try:
+                s3_client.head_bucket(Bucket=s3_bucket)
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == '404':
+                    # Bucket doesn't exist, create it
+                    try:
+                        region = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
+                        if region == "us-east-1":
+                            s3_client.create_bucket(Bucket=s3_bucket)
+                        else:
+                            s3_client.create_bucket(
+                                Bucket=s3_bucket,
+                                CreateBucketConfiguration={'LocationConstraint': region}
+                            )
+                        # Enable versioning
+                        s3_client.put_bucket_versioning(
+                            Bucket=s3_bucket,
+                            VersioningConfiguration={'Status': 'Enabled'}
+                        )
+                    except ClientError as create_error:
+                        s3_result["error"] = f"Failed to create bucket: {str(create_error)}"
+            
+            # Upload file to S3
+            if not s3_result["error"]:
+                s3_key = f"rca-reports/{safe_alert}-{timestamp}.md"
+                s3_client.upload_file(
+                    filename, 
+                    s3_bucket, 
+                    s3_key,
+                    ExtraArgs={
+                        'ContentType': 'text/markdown',
+                        'Metadata': {
+                            'alert-name': alert_name,
+                            'instance-id': instance_id,
+                            'severity': severity,
+                            'generated-ist': display_time
+                        }
+                    }
+                )
+                s3_result["uploaded"] = True
+                s3_result["s3_url"] = f"s3://{s3_bucket}/{s3_key}"
+    except Exception as e:
+        s3_result["error"] = str(e)
+
+    result = {
         "status": "saved",
         "file": filename,
         "alert": alert_name,
         "instance": instance_id,
-    }, indent=2)
+        "timestamp_ist": display_time,
+    }
+    
+    if s3_result["uploaded"]:
+        result["s3_uploaded"] = True
+        result["s3_url"] = s3_result["s3_url"]
+    elif s3_result["error"]:
+        result["s3_upload_failed"] = s3_result["error"]
+    
+    return json.dumps(result, indent=2)
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 def get_service_topology(
